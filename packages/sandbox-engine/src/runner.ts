@@ -7,48 +7,99 @@ import type {
   TestCase,
   Verdict,
 } from '@codeforge/shared-types';
-import { getDockerClient, resolveSandboxRuntime } from './docker-client.js';
+import {
+  getDockerClient,
+  resolveSandboxRuntime,
+  type RuntimeResolutionOptions,
+} from './docker-client.js';
 import { createTarArchive, extractFileFromTar } from './tar-utils.js';
 
 const RUNNER_IMAGE = 'codeforge-runner-cpp:latest';
-const MAX_OUTPUT_BYTES = 64 * 1024; // 64 KB limit to prevent output bombs
+export const DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024; // 64 KB default limit
+
+export interface RunnerOptions extends RuntimeResolutionOptions {
+  maxOutputBytes?: number;
+}
 
 /**
- * Demultiplexes standard Docker stream (8-byte header frame).
+ * Streaming Docker multiplex parser that enforces hard byte limits in real-time.
+ * If incoming stdout or stderr exceeds maxBytes, immediately triggers onLimitExceeded.
  */
-export function demuxDockerStream(buffer: Buffer): { stdout: string; stderr: string } {
-  const stdoutChunks: Buffer[] = [];
-  const stderrChunks: Buffer[] = [];
-  let offset = 0;
+export class StreamOutputCollector {
+  private buffer = Buffer.alloc(0);
+  private stdoutChunks: Buffer[] = [];
+  private stderrChunks: Buffer[] = [];
+  public stdoutBytes = 0;
+  public stderrBytes = 0;
+  public outputLimitExceeded = false;
 
-  while (offset + 8 <= buffer.length) {
-    const streamType = buffer.readUInt8(offset);
-    if (streamType !== 1 && streamType !== 2 && streamType !== 0) {
-      // Non-standard framing, treat whole buffer as stdout
-      stdoutChunks.push(buffer.subarray(offset));
-      break;
-    }
-    const payloadLength = buffer.readUInt32BE(offset + 4);
-    offset += 8;
+  constructor(
+    private maxBytes: number,
+    private onLimitExceeded: () => void
+  ) {}
 
-    const end = Math.min(offset + payloadLength, buffer.length);
-    const chunk = buffer.subarray(offset, end);
-    if (streamType === 2) {
-      stderrChunks.push(chunk);
-    } else {
-      stdoutChunks.push(chunk);
+  public processChunk(chunk: Buffer): void {
+    if (this.outputLimitExceeded) return;
+
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    while (this.buffer.length >= 8) {
+      const streamType = this.buffer.readUInt8(0);
+      if (streamType !== 1 && streamType !== 2 && streamType !== 0) {
+        // Non-standard frame; treat rest as stdout
+        this.appendStdout(this.buffer);
+        this.buffer = Buffer.alloc(0);
+        break;
+      }
+
+      const payloadLength = this.buffer.readUInt32BE(4);
+      if (this.buffer.length < 8 + payloadLength) {
+        // Incomplete frame, wait for more data
+        break;
+      }
+
+      const payload = this.buffer.subarray(8, 8 + payloadLength);
+      this.buffer = this.buffer.subarray(8 + payloadLength);
+
+      if (streamType === 2) {
+        this.appendStderr(payload);
+      } else {
+        this.appendStdout(payload);
+      }
+
+      if (this.outputLimitExceeded) {
+        break;
+      }
     }
-    offset += payloadLength;
   }
 
-  // Cap captured length
-  const stdoutBuf = Buffer.concat(stdoutChunks).subarray(0, MAX_OUTPUT_BYTES);
-  const stderrBuf = Buffer.concat(stderrChunks).subarray(0, MAX_OUTPUT_BYTES);
+  private appendStdout(payload: Buffer): void {
+    this.stdoutBytes += payload.length;
+    if (this.stdoutBytes > this.maxBytes) {
+      this.outputLimitExceeded = true;
+      this.onLimitExceeded();
+      return;
+    }
+    this.stdoutChunks.push(payload);
+  }
 
-  return {
-    stdout: stdoutBuf.toString('utf8'),
-    stderr: stderrBuf.toString('utf8'),
-  };
+  private appendStderr(payload: Buffer): void {
+    this.stderrBytes += payload.length;
+    if (this.stderrBytes > this.maxBytes) {
+      this.outputLimitExceeded = true;
+      this.onLimitExceeded();
+      return;
+    }
+    this.stderrChunks.push(payload);
+  }
+
+  public getStdout(): string {
+    return Buffer.concat(this.stdoutChunks).toString('utf8');
+  }
+
+  public getStderr(): string {
+    return Buffer.concat(this.stderrChunks).toString('utf8');
+  }
 }
 
 /**
@@ -69,46 +120,49 @@ export function normalizeOutput(text: string): string {
 export async function compileCpp(
   docker: Docker,
   sourceCode: string,
-  timeoutMs = 15000
+  timeoutMs = 15000,
+  options: RunnerOptions = {}
 ): Promise<{ success: true; binaryBuffer: Buffer } | { success: false; compileOutput: string }> {
-  const runtime = await resolveSandboxRuntime(docker);
-
-  const container = (await docker.createContainer({
-    Image: RUNNER_IMAGE,
-    Cmd: [
-      '/bin/sh',
-      '-c',
-      'g++ -O2 -std=c++20 -Wall -Wextra solution.cpp -o solution',
-    ],
-    AttachStdout: true,
-    AttachStderr: true,
-    NetworkDisabled: true,
-    User: '10001:10001',
-    WorkingDir: '/sandbox/workspace',
-    HostConfig: {
-      NetworkMode: 'none',
-      Memory: 512 * 1024 * 1024, // 512MB for compiler
-      MemorySwap: 512 * 1024 * 1024,
-      NanoCpus: 1_000_000_000,
-      PidsLimit: 64,
-      CapDrop: ['ALL'],
-      SecurityOpt: ['no-new-privileges:true'],
-      ReadonlyRootfs: false, // Compiler creates temp files & binary
-      Runtime: runtime,
-    },
-  })) as Docker.Container;
+  const runtime = await resolveSandboxRuntime(docker, options);
+  let container: Docker.Container | null = null;
+  let timeoutHandle: NodeJS.Timeout | null = null;
 
   try {
+    container = (await docker.createContainer({
+      Image: RUNNER_IMAGE,
+      Cmd: [
+        '/bin/sh',
+        '-c',
+        'g++ -O2 -std=c++20 -Wall -Wextra solution.cpp -o solution',
+      ],
+      AttachStdout: true,
+      AttachStderr: true,
+      NetworkDisabled: true,
+      User: '10001:10001',
+      WorkingDir: '/sandbox/workspace',
+      HostConfig: {
+        NetworkMode: 'none',
+        Memory: 512 * 1024 * 1024, // 512MB for compiler
+        MemorySwap: 512 * 1024 * 1024,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 64,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges:true'],
+        ReadonlyRootfs: false,
+        Runtime: runtime,
+      },
+    })) as Docker.Container;
+
     const archive = await createTarArchive([
       { name: 'solution.cpp', content: sourceCode, mode: 0o644 },
     ]);
     await container.putArchive(archive, { path: '/sandbox/workspace' });
 
     let timedOut = false;
-    const timeoutHandle = setTimeout(async () => {
+    timeoutHandle = setTimeout(async () => {
       timedOut = true;
       try {
-        await container.kill({ signal: 'SIGKILL' });
+        if (container) await container.kill({ signal: 'SIGKILL' });
       } catch {
         // Ignored
       }
@@ -116,7 +170,6 @@ export async function compileCpp(
 
     await container.start();
     const waitResult = await container.wait();
-    clearTimeout(timeoutHandle);
 
     const logBuffer = (await container.logs({
       stdout: true,
@@ -124,8 +177,10 @@ export async function compileCpp(
       follow: false,
     })) as unknown as Buffer;
 
-    const { stdout, stderr } = demuxDockerStream(logBuffer);
-    const compileOutput = (stderr + (stdout ? `\n${stdout}` : '')).trim();
+    // Simple collector for compiler output
+    const collector = new StreamOutputCollector(128 * 1024, () => {});
+    collector.processChunk(logBuffer);
+    const compileOutput = (collector.getStderr() + (collector.getStdout() ? `\n${collector.getStdout()}` : '')).trim();
 
     if (timedOut || waitResult.StatusCode !== 0) {
       return {
@@ -155,10 +210,16 @@ export async function compileCpp(
 
     return { success: true, binaryBuffer: binary };
   } finally {
-    try {
-      await container.remove({ force: true });
-    } catch {
-      // Ignored
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+    if (container) {
+      try {
+        await container.remove({ force: true });
+      } catch {
+        // Ignored
+      }
     }
   }
 }
@@ -170,48 +231,79 @@ export async function executeTestCase(
   docker: Docker,
   binaryBuffer: Buffer,
   testCase: TestCase,
-  limits: ExecutionLimits
+  limits: ExecutionLimits,
+  options: RunnerOptions = {}
 ): Promise<SingleTestResult> {
-  const runtime = await resolveSandboxRuntime(docker);
+  const runtime = await resolveSandboxRuntime(docker, options);
+  const maxOutputBytes = limits.maxOutputBytes || options.maxOutputBytes || DEFAULT_MAX_OUTPUT_BYTES;
 
-  const container = (await docker.createContainer({
-    Image: RUNNER_IMAGE,
-    Cmd: ['/bin/sh', '-c', './solution < input.txt'],
-    AttachStdout: true,
-    AttachStderr: true,
-    NetworkDisabled: true,
-    User: '10001:10001',
-    WorkingDir: '/sandbox/workspace',
-    HostConfig: {
-      NetworkMode: 'none',
-      Memory: limits.memoryLimitKb * 1024,
-      MemorySwap: limits.memoryLimitKb * 1024,
-      NanoCpus: 1_000_000_000,
-      PidsLimit: 32,
-      CapDrop: ['ALL'],
-      SecurityOpt: ['no-new-privileges:true'],
-      ReadonlyRootfs: false, // Standard Linux permissions restrict non-root UID 10001; putArchive requires writable layer
-      Tmpfs: {
-        '/tmp': 'rw,noexec,nosuid,size=16m',
-      },
-      Runtime: runtime,
-    },
-  })) as Docker.Container;
+  let container: Docker.Container | null = null;
+  let timeoutHandle: NodeJS.Timeout | null = null;
 
   try {
+    // We execute the binary and capture measured peak memory from cgroup v2 into .mem_usage
+    const execScript =
+      './solution < input.txt; EXIT=$?; ' +
+      '(cat /sys/fs/cgroup/memory.peak 2>/dev/null || cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0) > /sandbox/workspace/.mem_usage; ' +
+      'exit $EXIT';
+
+    container = (await docker.createContainer({
+      Image: RUNNER_IMAGE,
+      Cmd: ['/bin/sh', '-c', execScript],
+      AttachStdout: true,
+      AttachStderr: true,
+      NetworkDisabled: true,
+      User: '10001:10001',
+      WorkingDir: '/sandbox/workspace',
+      HostConfig: {
+        NetworkMode: 'none',
+        Memory: limits.memoryLimitKb * 1024,
+        MemorySwap: limits.memoryLimitKb * 1024,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 32,
+        CapDrop: ['ALL'],
+        SecurityOpt: ['no-new-privileges:true'],
+        ReadonlyRootfs: false,
+        Tmpfs: {
+          '/tmp': 'rw,noexec,nosuid,size=16m',
+        },
+        Runtime: runtime,
+      },
+    })) as Docker.Container;
+
     const archive = await createTarArchive([
       { name: 'solution', content: binaryBuffer, mode: 0o755 },
       { name: 'input.txt', content: testCase.input, mode: 0o644 },
     ]);
     await container.putArchive(archive, { path: '/sandbox/workspace' });
 
+    // Attach stream to enforce real-time output cap and terminate workloads that exceed it
+    const attachStream = (await container.attach({
+      stream: true,
+      stdout: true,
+      stderr: true,
+    })) as NodeJS.ReadableStream;
+
+    const collector = new StreamOutputCollector(maxOutputBytes, async () => {
+      // Workload exceeded output limit: immediately terminate
+      try {
+        if (container) await container.kill({ signal: 'SIGKILL' });
+      } catch {
+        // Ignored
+      }
+    });
+
+    attachStream.on('data', (chunk: Buffer) => {
+      collector.processChunk(chunk);
+    });
+
     const wallClockLimitMs = Math.max(1500, Math.floor(limits.timeLimitMs * 1.5));
     let timedOut = false;
 
-    const timeoutHandle = setTimeout(async () => {
+    timeoutHandle = setTimeout(async () => {
       timedOut = true;
       try {
-        await container.kill({ signal: 'SIGKILL' });
+        if (container) await container.kill({ signal: 'SIGKILL' });
       } catch {
         // Ignored
       }
@@ -221,19 +313,45 @@ export async function executeTestCase(
     await container.start();
     const waitResult = await container.wait();
     const elapsedMs = Math.round(performance.now() - startTime);
-    clearTimeout(timeoutHandle);
 
-    const logBuffer = (await container.logs({
-      stdout: true,
-      stderr: true,
-      follow: false,
-    })) as unknown as Buffer;
-
-    const { stdout, stderr } = demuxDockerStream(logBuffer);
     const inspect = await container.inspect();
 
-    let verdict: Verdict;
+    // Retrieve measured memory usage from cgroup v2
+    let measuredMemoryKb = 0;
     if (inspect.State.OOMKilled) {
+      measuredMemoryKb = limits.memoryLimitKb;
+    } else {
+      try {
+        const memTar = (await container.getArchive({
+          path: '/sandbox/workspace/.mem_usage',
+        })) as NodeJS.ReadableStream;
+
+        const chunks: Buffer[] = [];
+        for await (const chunk of memTar) {
+          chunks.push(chunk as Buffer);
+        }
+        const file = await extractFileFromTar(Buffer.concat(chunks), '.mem_usage');
+        if (file) {
+          const bytes = parseInt(file.toString('utf8').trim(), 10);
+          if (!isNaN(bytes) && bytes > 0) {
+            measuredMemoryKb = Math.round(bytes / 1024);
+          }
+        }
+      } catch {
+        // Fallback: 0 if not recorded
+      }
+    }
+
+    const stdout = collector.getStdout();
+    const stderr = collector.getStderr();
+
+    let verdict: Verdict;
+    let errorOutput = stderr;
+
+    if (collector.outputLimitExceeded) {
+      verdict = 'WRONG_ANSWER';
+      errorOutput = 'Output Limit Exceeded';
+    } else if (inspect.State.OOMKilled) {
       verdict = 'MEMORY_LIMIT_EXCEEDED';
     } else if (timedOut || elapsedMs > wallClockLimitMs) {
       verdict = 'TIME_LIMIT_EXCEEDED';
@@ -250,15 +368,21 @@ export async function executeTestCase(
       testCaseId: testCase.id,
       verdict,
       timeMs: elapsedMs,
-      memoryKb: Math.round((inspect.HostConfig?.Memory || limits.memoryLimitKb * 1024) / 1024),
-      actualOutput: stdout.substring(0, MAX_OUTPUT_BYTES),
-      errorOutput: stderr.substring(0, MAX_OUTPUT_BYTES),
+      memoryKb: measuredMemoryKb, // Actual measured usage from cgroup
+      actualOutput: stdout,
+      errorOutput: errorOutput || undefined,
     };
   } finally {
-    try {
-      await container.remove({ force: true });
-    } catch {
-      // Ignored
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+      timeoutHandle = null;
+    }
+    if (container) {
+      try {
+        await container.remove({ force: true });
+      } catch {
+        // Ignored
+      }
     }
   }
 }
@@ -269,12 +393,13 @@ export async function executeTestCase(
 export async function runCppSubmission(
   sourceCode: string,
   testCases: TestCase[],
-  limits: ExecutionLimits
+  limits: ExecutionLimits,
+  options: RunnerOptions = {}
 ): Promise<ExecutionSummary> {
   const docker = getDockerClient();
 
   // 1. Compile
-  const compileResult = await compileCpp(docker, sourceCode, 15000);
+  const compileResult = await compileCpp(docker, sourceCode, 15000, options);
   if (!compileResult.success) {
     return {
       verdict: 'COMPILE_ERROR',
@@ -292,7 +417,7 @@ export async function runCppSubmission(
   let peakMemoryKb = 0;
 
   for (const tc of testCases) {
-    const res = await executeTestCase(docker, compileResult.binaryBuffer, tc, limits);
+    const res = await executeTestCase(docker, compileResult.binaryBuffer, tc, limits, options);
     results.push(res);
     totalTimeMs += res.timeMs;
     peakMemoryKb = Math.max(peakMemoryKb, res.memoryKb);
